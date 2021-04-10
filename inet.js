@@ -17,44 +17,44 @@
 // q --|2|        |1|-- r
 //    n1\|--w  w--|/n2
 
+
 module.exports = function INet(rules) {
+  function parse_sexp(str) {
+    while (/\s/.test(str[0])) {
+      str = str.slice(1);
+    }
+    if (str[0] === "(") {
+      var term = [];
+      while (str[0] !== ")") {
+        var [str, argm] = parse_sexp(str.slice(1));
+        if (argm !== "") {
+          term.push(argm);
+        }
+      }
+      return [str.slice(1), term];
+    } else {
+      var term = "";
+      while (str !== "" && /[\w\-<>]/.test(str[0])) {
+        term += str[0];
+        str = str.slice(1);
+      }
+      return [str, term];
+    }
+  };
   function build_rules(code) {
-    function parse_rules(rules) {
-      function parse_sexp(str) {
-        while (/\s/.test(str[0])) {
-          str = str.slice(1);
-        }
-        if (str[0] === "(") {
-          var term = [];
-          while (str[0] !== ")") {
-            var [str, argm] = parse_sexp(str.slice(1));
-            if (argm !== "") {
-              term.push(argm);
-            }
-          }
-          return [str.slice(1), term];
-        } else {
-          var term = "";
-          while (str !== "" && /\w/.test(str[0])) {
-            term += str[0];
-            str = str.slice(1);
-          }
-          return [str, term];
-        }
-      };
-      return parse_sexp(rules)[1];
-    };
     function is_external(var_name) {
-      return /[ab][0-8]/.test(var_name);
+      return var_name[0] === "<" || var_name[1] === ">";
     }
     function dest_code(dest) {
-      if (/[ab][0-8]/.test(dest)) {
-        return dest[0]+"_out"+dest[1];
+      if (is_external(dest)) {
+        return dest[0] === "<" ? "a_out"+Number(dest[1]) : "b_out"+Number(dest[0]);
       } else {
         var [i,slot] = dest.split(":");
-        //return "new_port(n"+i+"_ptr, "+slot+")";
-        return "(((n"+i+"_dest << 4) | "+slot+") >>> 0)";
+        return port_code("n"+i+"_dest", slot);
       }
+    }
+    function port_code(dest, slot) {
+      return "((("+dest+" << 4) | "+slot+") >>> 0)";
     }
     function info_code(kind) {
       return kind;
@@ -66,14 +66,14 @@ module.exports = function INet(rules) {
         for (var j = 0; j < nodes[i].length; ++j) {
           var word = nodes[i][j];
           if (is_external(nodes[i][j])) {
-            word = word.replace("a","*").replace("b","a").replace("*","b");
+            word = word[0] === "<" ? word[1]+">" : "<"+word[0];
           }
           new_nodes[i].push(word);
         }
       }
       return new_nodes;
     }
-    var statements = parse_rules("("+code+")");
+    var statements = parse_sexp("("+code+")")[1];
     var kinds = {
       Air0: {name: "Air0", arity: 0, kind: 0},
       Air1: {name: "Air1", arity: 1, kind: 1},
@@ -92,14 +92,17 @@ module.exports = function INet(rules) {
       Air14: {name: "Air14", arity: 14, kind: 14},
       Air15: {name: "Air15", arity: 15, kind: 15},
       Rot: {name: "Rot", arity: 1, kind: 16},
+      Era: {name: "Era", arity: 1, kind: 17},
     };
     var rules = [];
+    var total_kinds = Object.keys(kinds).length;
     for (var statement of statements) {
       switch (statement[0]) {
         case "kind":
           var name = statement[1];
           var arity = Number(statement[2]);
           kinds[name] = {name, arity, kind: Object.keys(kinds).length};
+          total_kinds++;
           break;
         case "rule":
           rules.push(statement);
@@ -108,11 +111,42 @@ module.exports = function INet(rules) {
           throw "Unknown statement: " + kinds[0];
       }
     }
-    //console.log(kinds);
+
+    // Builds the erasure code for each kind
+    var erasures = "";
+    for (var k in kinds) {
+      var a_kind = kinds[k];
+      if (a_kind.kind >= 18) {
+        erasures += "      case "+a_kind.kind+": // --" + a_kind.name+";\n";
+        //erasures += "        console.log('--"+a_kind.name+"',a_dest);\n";
+        erasures += "        // gets neighbors\n";
+        for (var i = 1; i < a_kind.arity; ++i) {
+          erasures += "        a_out"+i+" = mem.val[a_dest+1+"+i+"];\n";
+        }
+        erasures += "        // turns old node into air\n";
+        erasures += "        mem.val[a_dest] = "+info_code(a_kind.arity)+";\n";
+        erasures += "        // attaches eraser to neighbor ports\n";
+        for (var i = 1; i < a_kind.arity; ++i) {
+          erasures += "        mem.val[get_dest(a_out"+i+")+1+get_slot(a_out"+i+")] = a_out"+i+";\n";
+        }
+        //erasures += "        // creates new ants\n";
+        //for (var i = 1; i < a_kind.arity; ++i) {
+          //erasures += "        new_ant.push([a_out"+i+"]);\n";
+        //}
+        erasures += "        // checks external ports for redexes\n";
+        for (var i = 1; i < a_kind.arity; ++i) {
+          erasures += "        check_redex(mem, get_dest(a_out"+i+"));\n";
+        }
+        erasures += "        // frees memory used by node\n";
+        erasures += "        free(mem, a_dest, "+(a_kind.arity+1)+");\n";
+        erasures += "        return true;\n";
+      }
+    }
+
+
+    // Builds the case code for each rule on the rule table
     var cases = "";
-    // For each rule on the rule table
-    for (var rule of rules) { 
-      //console.log("->", JSON.stringify(rule));
+    for (var rule of rules) {
 
       // For both orientations of the rule
       for (var flipped = 0; flipped < 2; ++flipped) {
@@ -147,18 +181,19 @@ module.exports = function INet(rules) {
         for (var i = 0; i < nodes.length; ++i) {
           var node = nodes[i];
           if (kinds[node[0]]) {
-            for (var i_slot = 1; i_slot < node.length; ++i_slot) {
-              if (is_external(node[i_slot])) { // external connection
-                links[node[i_slot]] = i + ":" + i_slot;
-                links[i + ":" + i_slot] = node[i_slot];
+            var vars = node.slice(1);
+            for (var i_slot = 0; i_slot < vars.length; ++i_slot) {
+              if (is_external(vars[i_slot])) { // external connection
+                links[vars[i_slot]] = i+":"+i_slot;
+                links[i+":"+i_slot] = vars[i_slot];
               } else { // internal connection
-                if (!links[node[i_slot]]) {
-                  links[node[i_slot]] = i + ":" + i_slot;
+                if (!links[vars[i_slot]]) {
+                  links[vars[i_slot]] = i+":"+i_slot;
                 } else {
-                  var [j,j_slot] = links[node[i_slot]].split(":").map(Number);
-                  delete links[node[i_slot]];
-                  links[i+":"+i_slot] = j + ":" + j_slot;
-                  links[j+":"+j_slot] = i + ":" + i_slot;
+                  var [j,j_slot] = links[vars[i_slot]].split(":").map(Number);
+                  delete links[vars[i_slot]];
+                  links[i+":"+i_slot] = j+":"+j_slot;
+                  links[j+":"+j_slot] = i+":"+i_slot;
                 }
               }
             }
@@ -167,66 +202,98 @@ module.exports = function INet(rules) {
             links[node[1]] = node[0];
           }
         }
+        //console.log("NODES", nodes); 
+        //console.log("LINKS", links);
+        //process.exit();
+        //console.log(kinds);
 
         // Builds the case code
-        cases += "    case "+(b_kind.kind * rules.length + a_kind.kind)+": // " + a_kind.name+"-"+b_kind.name+";\n";
-        cases += "      // gets neighbors\n";
-        for (var i = 2; i <= a_kind.arity; ++i) {
-          cases += "      a_out"+i+" = mem.val[a_dest+"+i+"];\n"
+        cases += "      case "+(b_kind.kind * total_kinds + a_kind.kind)+": // " + a_kind.name+"-"+b_kind.name+";\n";
+        //cases += "        console.log('"+a_kind.name+"-"+b_kind.name+"');\n";
+        cases += "        // gets neighbors\n";
+        for (var i = 1; i < a_kind.arity; ++i) {
+          cases += "        a_out"+i+" = mem.val[a_dest+1+"+i+"];\n"
         }
-        for (var i = 2; i <= a_kind.arity; ++i) {
-          cases += "      b_out"+i+" = mem.val[b_dest+"+i+"];\n"
+        for (var i = 1; i < b_kind.arity; ++i) {
+          cases += "        b_out"+i+" = mem.val[b_dest+1+"+i+"];\n"
         }
-        cases += "      // allocs new nodes\n";
+        cases += "        // allocs new nodes\n";
         for (var i = 0; i < nodes.length; ++i) {
           var node = nodes[i];
           if (kinds[node[0]]) {
-            cases += "      n"+i+"_dest = alloc(mem,"+(kinds[node[0]].arity+1)+");\n";
+            cases += "        n"+i+"_dest = alloc(mem,"+(kinds[node[0]].arity+1)+");\n";
           }
         }
-        cases += "      // fills new nodes\n";
+        cases += "        // fills new nodes\n";
         for (var i = 0; i < nodes.length; ++i) {
           var new_node = nodes[i];
           var new_kind = kinds[new_node[0]];
           if (new_kind) {
-            cases += "      mem.val[n"+i+"_dest+0] = "+info_code(new_kind.kind)+";\n";
-            for (var slot = 1; slot <= new_kind.arity; ++slot) {
+            cases += "        mem.val[n"+i+"_dest] = "+info_code(new_kind.kind)+";\n";
+            for (var slot = 0; slot < new_kind.arity; ++slot) {
               var var_name = new_node[slot];
-              cases += "      mem.val[n"+i+"_dest+"+slot+"] = "+dest_code(links[i+":"+slot])+";\n";
+              cases += "        mem.val[n"+i+"_dest+1+"+slot+"] = "+dest_code(links[i+":"+slot])+";\n";
             }
           }
         }
-        cases += "      // turns old nodes into air\n";
-        cases += "      mem.val[a_dest] = "+info_code(a_kind.arity)+";\n";
-        cases += "      mem.val[b_dest] = "+info_code(b_kind.arity)+";\n";
-        cases += "      // points air ports to new destinations\n";
-        for (var slot = 2; slot <= a_kind.arity; ++slot) {
-          cases += "      mem.val[a_dest+"+slot+"] = "+dest_code(links["a"+slot])+";\n";
+        cases += "        // turns old nodes into air\n";
+        cases += "        mem.val[a_dest] = "+info_code(a_kind.arity)+";\n";
+        cases += "        mem.val[b_dest] = "+info_code(b_kind.arity)+";\n";
+        cases += "        // points air ports to new destinations\n";
+        for (var slot = 1; slot < a_kind.arity; ++slot) {
+          cases += "        mem.val[a_dest+1+"+slot+"] = "+dest_code(links["<"+slot])+";\n";
         }
-        for (var slot = 2; slot <= b_kind.arity; ++slot) {
-          cases += "      mem.val[b_dest+"+slot+"] = "+dest_code(links["b"+slot])+";\n";
+        for (var slot = 1; slot < b_kind.arity; ++slot) {
+          cases += "        mem.val[b_dest+1+"+slot+"] = "+dest_code(links[slot+">"])+";\n";
         }
-        cases += "      // attaches external ports\n";
-        for (var slot = 2; slot <= a_kind.arity; ++slot) {
-          cases += "      attach(mem, a_out"+slot+");\n";
+        cases += "        // attaches external ports\n";
+        for (var slot = 1; slot < a_kind.arity; ++slot) {
+          cases += "        attach(mem, a_out"+slot+");\n";
         }
-        for (var slot = 2; slot <= b_kind.arity; ++slot) {
-          cases += "      attach(mem, b_out"+slot+");\n";
+        for (var slot = 1; slot < b_kind.arity; ++slot) {
+          cases += "        attach(mem, b_out"+slot+");\n";
         }
-        cases += "      // attaches internal ports that must point to external ports\n";
+        cases += "        // attaches internal ports that must point to external ports\n";
         for (var i = 0; i < nodes.length; ++i) {
           var node = nodes[i];
           if (kinds[node[0]]) {
-            for (var slot = 1; slot <= kinds[node[0]].arity; ++slot) {
+            for (var slot = 0; slot < kinds[node[0]].arity; ++slot) {
               if (is_external(links[i+":"+slot])) {
-                cases += "      attach(mem, "+dest_code(i+":"+slot)+");\n";
+                cases += "        attach(mem, "+dest_code(i+":"+slot)+");\n";
               }
             }
           }
         }
-        cases += "      return true;\n";
+        cases += "        // checks new nodes for redexes\n";
+        for (var i = 0; i < nodes.length; ++i) {
+          if (kinds[node[0]]) {
+            cases += "        check_redex(mem, n"+i+"_dest);\n";
+          }
+        }
+        cases += "        // checks external ports for redexes\n";
+        for (var slot = 1; slot < a_kind.arity; ++slot) {
+          cases += "        check_redex(mem, get_dest(a_out"+slot+"));\n";
+        }
+        for (var slot = 1; slot < b_kind.arity; ++slot) {
+          cases += "        check_redex(mem, get_dest(b_out"+slot+"));\n";
+        }
+        //for (var slot = 1; slot < a_kind.arity; ++slot) {
+          //if (links["<"+slot] === "<"+slot) {
+            //cases += "        new_ant.push(["+dest_code("<"+slot)+"]);\n";
+          //}
+        //}
+        //for (var slot = 1; slot < b_kind.arity; ++slot) {
+          //if (links[slot+">"] === slot+">") {
+            //cases += "        new_ant.push(["+dest_code(slot+">")+"]);\n";
+          //}
+        //}
+        cases += "        free(mem, a_dest, "+(a_kind.arity+1)+");\n";
+        cases += "        free(mem, b_dest, "+(b_kind.arity+1)+");\n";
+        cases += "        return true;\n";
       }
-    };
+    }
+
+    // Completes the kinds object
     for (var kind_name in kinds) {
       kinds[kinds[kind_name].kind] = kinds[kind_name];
     }
@@ -234,22 +301,33 @@ module.exports = function INet(rules) {
     var rewrite_source = [
       "(function rewrite(mem, a_dest, b_dest) {",
       "  var a_info, b_info, a_kind, b_kind;",
-      "  var a_out2, a_out3, a_out4, a_out5, a_out6, a_out7, a_out8;",
-      "  var b_out2, b_out3, b_out4, b_out5, b_out6, b_out7, b_out8;",
+      "  var a_out1, a_out2, a_out3, a_out4, a_out5, a_out6, a_out7, a_out8;",
+      "  var a_out1, b_out2, b_out3, b_out4, b_out5, b_out6, b_out7, b_out8;",
       "  var n0_dest, n1_dest, n2_dest, n3_dest, n4_dest, n5_dest, n6_dest, n7_dest;",
       "  a_info = mem.val[a_dest];",
       "  b_info = mem.val[b_dest];",
       "  a_kind = get_kind(a_info);",
       "  b_kind = get_kind(b_info);",
-      "  // Performs reduction",
-      "  switch (b_kind * "+rules.length+" + a_kind) {",
+      "  // Performs erasure",
+      "  if (a_dest === b_dest) {",
+      "    switch (a_kind) {",
+      erasures,
+      "    }",
+      "  } else {",
+      "    // Performs reduction",
+      "    switch (b_kind * "+total_kinds+" + a_kind) {",
       cases,
+      "    }",
       "  }",
       "  return false;",
       "})",
     ].join("\n");
 
+    
+    //console.log(rewrite_source);
     var rewrite = eval(rewrite_source);
+    //console.log(rewrite);
+    //process.exit();
 
     return {cases, kinds, rewrite_source, rewrite};
   };
@@ -257,17 +335,29 @@ module.exports = function INet(rules) {
   var {kinds, rewrite} = build_rules(rules);
 
   function Memory() {
-    return {val: [], ant: [], len: 0};
+    return {
+      val: [],
+      ant: [],
+      red: [],
+      use: [[],[],[],[],[],[],[],[],[],[],[],[],[],[],[],[]],
+      len: 0,
+      rwt: 0,
+    };
   }
 
   function alloc(mem, size) {
-    var ptr = mem.len;
-    mem.len += size;
-    return ptr;
+    var reused = mem.use[size].pop();
+    if (reused) {
+      return reused;
+    } else {
+      var dest = mem.len;
+      mem.len += size;
+      return dest;
+    }
   }
 
-  function clear() {
-    // TODO
+  function free(mem, dest, size) {
+    mem.use[size].push(dest);
   }
 
   function new_port(dest, slot) {
@@ -284,12 +374,21 @@ module.exports = function INet(rules) {
 
   // If port points to air, attach it to the next concrete node
   function attach(mem, port) {
-    var next = mem.val[get_dest(port) + get_slot(port)];
+    var next = mem.val[get_dest(port) + 1 + get_slot(port)];
     while (is_air(get_kind(mem.val[get_dest(next)]))) {
-      next = mem.val[get_dest(next) + get_slot(next)];
+      //console.log("ue", next, get_dest(next), get_slot(next));
+      next = mem.val[get_dest(next) + 1 + get_slot(next)];
     }
     //console.log("pointing", port, "to", next);
-    mem.val[get_dest(port) + get_slot(port)] = next;
+    mem.val[get_dest(port) + 1 + get_slot(port)] = next;
+    //if (port <= next && get_slot(port) === 0 && get_slot(next) === 0) {
+      //console.log("found redex", get_dest(port), get_dest(next));
+      //mem.red.push(get_dest(port));
+    //}
+    //if (get_kind(mem.val[get_dest(next)]) === kinds.Era.kind) {
+    //if (get_kind(mem.val[get_dest(port)]) === kinds.Era.kind) {
+      //console.log("LINKED ERA");
+    //}
   }
 
   // PortIsNum:16 | Done:1 | Kind:15 | 
@@ -318,44 +417,117 @@ module.exports = function INet(rules) {
   }
 
   function reduce_step(mem) {
-    var new_ant = [];
-    for (var ant = 0; ant < mem.ant.length; ++ant) {
-      var prev = mem.ant[ant].pop();
-      var next = mem.val[get_dest(prev) + get_slot(prev)];
-      var info = mem.val[get_dest(next)];
-      var kind = get_kind(info);
-      // We're on air. Some ant reduced our node.
-      if (is_air(kind)) {
-        new_ant.push(mem.ant[ant]);
-      // We're on a node.
-      } else if (!is_done(info)) {
-        // On main port
-        if (get_slot(next) === 1) {
-          var rewritten = false;
-          // If active pair: perform rewrite, go back
-          if (get_slot(prev) === 1) {
-            if (rewrite(mem, get_dest(prev), get_dest(next))) {
-              rewritten = true;
-              new_ant.push(mem.ant[ant]);
-            }
-          }
-          // If not active: mark node as done, go to its aux ports
-          if (!rewritten) {
-            var arity = kinds[kind].arity;
-            mem.val[get_dest(next)] = set_done(info);
-            for (var slot = 2; slot <= arity; ++slot) {
-              new_ant.push([new_port(get_dest(next), slot)]);
-            }
-          }
-        // On aux port: push slot to back-array, go to main port
-        } else {
-          mem.ant[ant].push(prev);
-          mem.ant[ant].push(new_port(get_dest(next), 1));
-          new_ant.push(mem.ant[ant]);
-        }
+    //var new_ant = [];
+    //for (var ant = 0; ant < mem.ant.length; ++ant) {
+      //if (mem.ant[ant].length > 0) {
+        //var prev = mem.ant[ant].pop();
+        //var next = mem.val[get_dest(prev) + 1 + get_slot(prev)];
+        //var next_info = mem.val[get_dest(next)];
+        //var next_kind = get_kind(next_info);
+        ////console.log("...", get_dest(prev), get_dest(next));
+        ////var prev_info = mem.val[get_dest(prev)];
+        ////var prev_kind = get_kind(prev_info);
+        ////var prev_arit = kinds[prev_kind].arity;
+        //// We're on air. Some ant reduced our node.
+        //if (is_air(next_kind)) {
+          //new_ant.push(mem.ant[ant]);
+        //// We're on a node.
+        //} else if (!is_done(next_info)) {
+          //// On main port
+          //if (get_slot(next) === 0) {
+            //var rewritten = false;
+            //// If active pair: perform rewrite, go back
+            //if (get_slot(prev) === 0) {
+              ////var neigs = [];
+              ////// Collects neighbors
+              ////console.log("...", prev_arit, next_arit);
+              ////for (var slot = 2; slot <= prev_arit; ++slot) {
+                ////neigs.push(mem.val[get_dest(prev) + slot]);
+              ////}
+              ////for (var slot = 2; slot <= next_arit; ++slot) {
+                ////neigs.push(mem.val[get_dest(next) + slot]);
+              ////}
+              //// Rewrites
+              //if (rewrite(mem, get_dest(prev), get_dest(next))) {
+                //rewritten = true;
+                //new_ant.push(mem.ant[ant]);
+                ////console.log("new_ant_push", mem.ant[ant]);
+                ////console.log("->", neigs.length);
+                ////for (var n = 0; n < neigs.length; ++n) {
+                  ////console.log("??", mem.val[get_dest(neigs[n]) + get_slot(neigs[n])], neigs[n]);
+                  ////if (mem.val[neigs[n]] === neigs[n]) {
+                    ////console.log("Attached an erase.");
+                  ////}
+                ////}
+              //}
+            //}
+            //// If not active: mark node as done, go to its aux ports
+            //if (!rewritten) {
+              //mem.val[get_dest(next)] = set_done(next_info);
+              //var next_arit = kinds[next_kind].arity;
+              //for (var slot = 1; slot < next_arit; ++slot) {
+                //new_ant.push([new_port(get_dest(next), slot)]);
+              //}
+            //}
+          //// On aux port: push slot to back-array, go to main port
+          //} else {
+            //mem.ant[ant].push(prev);
+            //mem.ant[ant].push(new_port(get_dest(next), 0));
+            //new_ant.push(mem.ant[ant]);
+          //}
+        //}
+      //}
+    //}
+    //mem.ant = new_ant;
+    var red = mem.red;
+    mem.red = [];
+    for (var r = 0; r < red.length; ++r) {
+      var a_dest = red[r];
+      var a_out0 = mem.val[a_dest+1];
+      var b_dest = get_dest(a_out0);
+      var b_out0 = mem.val[b_dest+1];
+      //var a_kind = get_kind(mem.val[a_dest]);
+      //var b_kind = get_kind(mem.val[b_dest]);
+      if (get_slot(a_out0) === 0 && get_slot(b_out0) === 0) {
+        rewrite(mem, a_dest, b_dest);
       }
+      mem.rwt += 1;
     }
-    mem.ant = new_ant;
+  }
+
+  //function check(mem, red) {
+    //var good = true;
+    //for (var dest = 0; dest < mem.val.length; dest = dest + arit + 1) {
+      //var info = mem.val[dest];
+      //var kind = get_kind(info);
+      //var arit = kinds[kind].arity;
+      //var main = mem.val[dest+1];
+      //if (kind >= 18 && main === mem.val[get_dest(main)+1+get_slot(main)] && mem.red.indexOf(dest) === -1 && red.indexOf(dest) === -1) {
+        //console.log("bad", dest);
+        //good = false;
+      //}
+    //}
+    //return good;
+  //}
+
+  function find_redexes(mem) {
+    mem.red = [];
+    for (var dest = 0; dest < mem.val.length; dest = dest + arit + 1) {
+      var arit = kinds[get_kind(mem.val[dest])].arity;
+      check_redex(mem, dest);
+    }
+  }
+
+  function check_redex(mem, dest) {
+    //console.log("check redex", dest);
+    //if (dest === undefined) {
+      //throw new Error("ue");
+      //process.exit();
+    //}
+    var next = mem.val[dest+1];
+    if (get_slot(next) === 0) {
+      mem.red.push(dest);
+    }
   }
 
   function read(code) {
@@ -370,17 +542,18 @@ module.exports = function INet(rules) {
         var ptr = alloc(mem, words.length);
         mem.val[ptr] = new_info(kind, 0);
         //console.log("->", name, kind, kinds);
-        if (words.length - 1 !== kinds[kind].arity) {
+        if (words.length !== kinds[kind].arity + 1) {
           throw "Wrong arity on " + kind + ": " + (words.length - 1) + " instead of " + kinds[kind].arity + ".";
         }
-        for (var j = 1; j <= kinds[kind].arity; ++j) {
-          var dest = vars[words[j]];
-          if (dest) {
-            mem.val[get_dest(dest) + get_slot(dest)] = new_port(ptr, j);
-            mem.val[ptr + j] = dest;
+        for (var j = 0; j < kinds[kind].arity; ++j) {
+          var dest = vars[words[j+1]];
+          //console.log(i,j,JSON.stringify(vars));
+          if (dest !== undefined) {
+            mem.val[get_dest(dest)+1+get_slot(dest)] = new_port(ptr, j);
+            mem.val[ptr+1+j] = dest;
           } else {
-            vars[words[j]] = new_port(ptr, j);
-            mem.val[ptr + j] = new_port(ptr, j);
+            vars[words[j+1]] = new_port(ptr, j);
+            mem.val[ptr+1+j] = new_port(ptr, j);
           }
         }
       }
@@ -417,19 +590,27 @@ module.exports = function INet(rules) {
     while (dest < mem.val.length) {
       var info = mem.val[dest];
       var kind = get_kind(info);
+      //console.log(mem);
+      //console.log("->", info, get_kind(info));
       var {name, arity} = kinds[get_kind(info)];
       if (!is_air(kind)) {
-        var line = padr(6, name);
-        for (var slot = 1; slot <= arity; ++slot) {
+        var line = padr(5, name);
+        for (var slot = 0; slot < arity; ++slot) {
           var self_port_key = dest+":"+slot;
-          var dest_port_key = get_dest(mem.val[dest+slot])+":"+get_slot(mem.val[dest+slot]);
-          var name = names[self_port_key] || nth_name(count++);
+          var dest_port_key = get_dest(mem.val[dest+1+slot])+":"+get_slot(mem.val[dest+1+slot]);
+          if (self_port_key === dest_port_key) {
+            var name = "@";
+          } else {
+            var name = names[self_port_key] || nth_name(count++);
+          }
           var anty = has_ant[self_port_key] ? "*" : "";
           names[dest_port_key] = name;
+          //var name = name + "-" + new_port(dest,slot);
           line = line + " " + padr(4, name.toUpperCase() + anty);
         }
         var done = is_done(info) ? "-" : " ";
         line = padl(4, String(dest)) + " |" + done + " " + line;
+        line = (mem.red.indexOf(dest) !== -1 ? "#" : "|") + line;
         lines.push(line);
       }
       dest = dest + 1 + arity;
@@ -441,17 +622,19 @@ module.exports = function INet(rules) {
     build_rules,
     Memory,
     alloc,
-    clear,
+    free,
     new_port,
     get_dest,
     get_slot,
     attach,
     new_info,
     port_is_num,
+    find_redexes,
     is_done,
     set_done,
     get_kind,
     is_air,
+    rewrite,
     reduce_step,
     read,
     show,
