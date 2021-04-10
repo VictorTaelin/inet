@@ -87,5 +87,5 @@ const N31 = S(N30);
 const N32 = S(N31);
 
 
-console.log(show(Bus(N25, O32)));
+console.log(show(Bus(N26, O32)));
 console.log(K);

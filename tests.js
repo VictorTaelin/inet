@@ -182,14 +182,20 @@ Suc o p
 Suc p q
 Suc q r
 Suc r s
-Zer s
+Suc s t
+Suc t u
+Suc u v
+Suc v w
+Suc w x
+Suc x y
+Zer y
 `);
 
 inet.find_redexes(mem);
 console.log(inet.show(mem));
 
 var step = 0;
-while (mem.red.length > 0 && step < 1000000) {
+while (mem.red.length > 0 && step < 10000000) {
   //console.log("step " + step + ":");
   inet.reduce_step(mem);
   //console.log(inet.show(mem));
