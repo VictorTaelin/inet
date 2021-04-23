@@ -383,6 +383,7 @@ module.exports = function INet(rules) {
 
     function case_to_rules(equat) {
       var rules = [];
+      var arity = {};
       //console.log(JSON.stringify(equat));
       var vars = [];
       var func = equat[0];
@@ -446,6 +447,7 @@ module.exports = function INet(rules) {
               return result;
             }
           }
+          arity[call] = kinds[func].arity - arg + 1 + vars.length;
           var var_name = {};
           // Registers fields of last matched ctor
           for (var i = 0; i < kinds[ctor[0]].arity-1; ++i) {
@@ -468,7 +470,7 @@ module.exports = function INet(rules) {
           break;
         }
       }
-      return rules;
+      return {rules, arity};
     }
 
     var [code_rest, statements] = parse_sexp("("+code+")");
@@ -522,10 +524,20 @@ module.exports = function INet(rules) {
           rules.push(statement);
           break;
         case "case":
-          var new_rules = case_to_rules(statement[1].concat([statement[2]]));
+          var {rules: new_rules, arity: new_arity} = case_to_rules(statement[1].concat([statement[2]]));
           for (var new_rule of new_rules) {
             //console.log("pushing", show_sexp(new_rule));
             rules.push(new_rule);
+          }
+          for (var new_rule_name in new_arity) {
+            if (!kinds[new_rule_name]) {
+              kinds[new_rule_name] = {
+                name: new_rule_name,
+                arity: new_arity[new_rule_name],
+                is_ctor: false,
+                kind: Object.keys(kinds).length,
+              }
+            }
           }
           break;
         default:
@@ -602,6 +614,7 @@ module.exports = function INet(rules) {
         // Gets active pair kinds (ex: `{name: 'Add', arity: 3, kind: 4}`)
         var a_kind = kinds[a_name];
         var b_kind = kinds[b_name];
+        //console.log(a_name, b_name);
 
         // Builds map of linked ports, both internal and external.
         // Internal ports are represented as 'i:s'
