@@ -94,7 +94,7 @@ var mem = inet.read_tree("(Not (Not (Not (T))))");
 var mem = inet.read_tree("(If (T) (S Z) Z)");
 var mem = inet.read_tree("(Double (S (S (S (Z)))))");
 var mem = inet.read_tree("(Bus (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (Z))))))))))))))))))))) (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O (O E)))))))))))))))))))))))))))))))))");
-var mem = inet.read_tree("(Sum (I (I (O (O (E))))) (O (I (O (O (E))))))");
+//var mem = inet.read_tree("(Sum (I (I (O (O (E))))) (O (I (O (O (E))))))");
 
 inet.find_redexes(mem);
 console.log(inet.show_tree(mem));

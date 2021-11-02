@@ -70,11 +70,12 @@ module.exports = function INet(rules) {
 
   // If port points to air, attach it to the next concrete node
   function attach(mem, port) {
-    var next = mem.val[get_dest(port) + 1 + get_slot(port)];
-    while (is_air(get_kind(mem.val[get_dest(next)]))) {
-      next = mem.val[get_dest(next) + 1 + get_slot(next)];
+    var idx0 = (port >>> 4) + 1 + (port & 0xF);
+    var next = mem.val[idx0];
+    while ((mem.val[(next >>> 4)] & 0x7FFF) < 16) {
+      next = mem.val[(next >>> 4) + 1 + (next & 0xF)];
     }
-    mem.val[get_dest(port) + 1 + get_slot(port)] = next;
+    mem.val[idx0] = next;
   }
 
   // PortIsNum:16 | Done:1 | Kind:15 | 
@@ -236,6 +237,7 @@ module.exports = function INet(rules) {
         }
       }
     };
+    find_redexes(mem);
     return mem;
   }
 
@@ -322,6 +324,7 @@ module.exports = function INet(rules) {
     var count = 0;
     function go(up, expr) {
       var node = [expr[0]];
+      //console.log(expr[0], kinds);
       if (kinds[expr[0]].is_ctor) {
         node.push(up);
         for (var i = 1; i < expr.length; ++i) {
@@ -364,21 +367,6 @@ module.exports = function INet(rules) {
 
     function info_code(kind) {
       return kind;
-    }
-
-    function flip_nodes(nodes) {
-      var new_nodes = [];
-      for (var i = 0; i < nodes.length; ++i) {
-        new_nodes.push([]);
-        for (var j = 0; j < nodes[i].length; ++j) {
-          var word = nodes[i][j];
-          if (is_external(nodes[i][j])) {
-            word = word[0] === "<" ? ">"+word[1] : "<"+word[1];
-          }
-          new_nodes[i].push(word);
-        }
-      }
-      return new_nodes;
     }
 
     function case_to_rules(equat) {
@@ -592,165 +580,137 @@ module.exports = function INet(rules) {
     var cases = "";
 
     for (var rule of rules) {
+      // Gets active pair kinds (ex: `{name: 'Add', arity: 3, kind: 4}`)
+      var a_name = rule[1];
+      var b_name = rule[2];
+      var nodes  = rule.slice(3);
+      var a_kind = kinds[a_name];
+      var b_kind = kinds[b_name];
 
-      // For both orientations of the rule
-      for (var flipped = 0; flipped < 2; ++flipped) {
-        // Flips rule if needed
-        if (flipped === 0) {
-          var a_name = rule[1];
-          var b_name = rule[2];
-          var nodes = rule.slice(3);
-        } else {
-          var a_name = rule[2];
-          var b_name = rule[1];
-          var nodes = flip_nodes(rule.slice(3));
-        }
-
-        // Skips if symmetric
-        if (a_name === b_name && flipped === 1) {
-          continue;
-        }
-
-        // Gets active pair kinds (ex: `{name: 'Add', arity: 3, kind: 4}`)
-        var a_kind = kinds[a_name];
-        var b_kind = kinds[b_name];
-        //console.log(a_name, b_name);
-
-        // Builds map of linked ports, both internal and external.
-        // Internal ports are represented as 'i:s'
-        // - 'i' is the number of the new allocated node
-        // - 's' is the slot
-        // External ports are represented as 'xN'
-        // - 'x' is 'a' if it is neighbor of the first active node, 'b' otherwise
-        // - 's' is the slot of the active node that points to that port
-        var links = {}; // internal connections
-        for (var i = 0; i < nodes.length; ++i) {
-          var node = nodes[i];
-          if (kinds[node[0]]) {
-            var vars = node.slice(1);
-            for (var i_slot = 0; i_slot < vars.length; ++i_slot) {
-              if (is_external(vars[i_slot])) { // external connection
+      // Builds map of linked ports, both internal and external.
+      // Internal ports are represented as 'i:s'
+      // - 'i' is the number of the new allocated node
+      // - 's' is the slot
+      // External ports are represented as 'xN'
+      // - 'x' is 'a' if it is neighbor of the first active node, 'b' otherwise
+      // - 's' is the slot of the active node that points to that port
+      var links = {}; // internal connections
+      for (var i = 0; i < nodes.length; ++i) {
+        var node = nodes[i];
+        if (kinds[node[0]]) {
+          var vars = node.slice(1);
+          for (var i_slot = 0; i_slot < vars.length; ++i_slot) {
+            if (is_external(vars[i_slot])) { // external connection
+              links[vars[i_slot]] = i+":"+i_slot;
+              links[i+":"+i_slot] = vars[i_slot];
+            } else { // internal connection
+              if (!links[vars[i_slot]]) {
                 links[vars[i_slot]] = i+":"+i_slot;
-                links[i+":"+i_slot] = vars[i_slot];
-              } else { // internal connection
-                if (!links[vars[i_slot]]) {
-                  links[vars[i_slot]] = i+":"+i_slot;
-                } else {
-                  var [j,j_slot] = links[vars[i_slot]].split(":").map(Number);
-                  delete links[vars[i_slot]];
-                  links[i+":"+i_slot] = j+":"+j_slot;
-                  links[j+":"+j_slot] = i+":"+i_slot;
-                }
-              }
-            }
-          } else {
-            links[node[0]] = node[1];
-            links[node[1]] = node[0];
-          }
-        }
-
-        // Links unused ports to themselves, triggering erasure
-        for (var i = 1; i < a_kind.arity; ++i) {
-          if (!links["<"+i]) {
-            links["<"+i] = "<"+i;
-          }
-        }
-        for (var i = 1; i < b_kind.arity; ++i) {
-          if (!links[">"+i]) {
-            links[">"+i] = ">"+i;
-          }
-        }
-
-        //console.log("LINKS", links);
-        //process.exit();
-        //console.log(kinds);
-
-        // Builds the case code
-        //console.log(a_kind, b_kind);
-        cases += "      case "+(b_kind.kind * total_kinds + a_kind.kind)+": // " + a_kind.name+"-"+b_kind.name+";\n";
-        //cases += "        console.log('"+a_kind.name+"-"+b_kind.name+"');\n";
-        cases += "        // gets neighbors\n";
-        for (var i = 1; i < a_kind.arity; ++i) {
-          cases += "        a_out"+i+" = mem.val[a_dest+1+"+i+"];\n"
-        }
-        for (var i = 1; i < b_kind.arity; ++i) {
-          cases += "        b_out"+i+" = mem.val[b_dest+1+"+i+"];\n"
-        }
-        cases += "        // allocs new nodes\n";
-        for (var i = 0; i < nodes.length; ++i) {
-          var node = nodes[i];
-          if (kinds[node[0]]) {
-            cases += "        n"+i+"_dest = alloc(mem,"+(kinds[node[0]].arity+1)+");\n";
-          }
-        }
-        cases += "        // fills new nodes\n";
-        for (var i = 0; i < nodes.length; ++i) {
-          var new_node = nodes[i];
-          var new_kind = kinds[new_node[0]];
-          if (new_kind) {
-            cases += "        mem.val[n"+i+"_dest] = "+info_code(new_kind.kind)+";\n";
-            for (var slot = 0; slot < new_kind.arity; ++slot) {
-              var var_name = new_node[slot];
-              //console.log(a_kind.name, b_kind.name, i+":"+slot, links[i+":"+slot])
-              cases += "        mem.val[n"+i+"_dest+1+"+slot+"] = "+dest_code(links[i+":"+slot])+";\n";
-            }
-          }
-        }
-        cases += "        // turns old nodes into air\n";
-        cases += "        mem.val[a_dest] = "+info_code(a_kind.arity)+";\n";
-        cases += "        mem.val[b_dest] = "+info_code(b_kind.arity)+";\n";
-        cases += "        // points air ports to new destinations\n";
-        for (var slot = 1; slot < a_kind.arity; ++slot) {
-          cases += "        mem.val[a_dest+1+"+slot+"] = "+dest_code(links["<"+slot])+";\n";
-        }
-        for (var slot = 1; slot < b_kind.arity; ++slot) {
-          cases += "        mem.val[b_dest+1+"+slot+"] = "+dest_code(links[">"+slot])+";\n";
-        }
-        cases += "        // attaches external ports\n";
-        for (var slot = 1; slot < a_kind.arity; ++slot) {
-          cases += "        attach(mem, a_out"+slot+");\n";
-        }
-        for (var slot = 1; slot < b_kind.arity; ++slot) {
-          cases += "        attach(mem, b_out"+slot+");\n";
-        }
-        cases += "        // attaches internal ports that must point to external ports\n";
-        for (var i = 0; i < nodes.length; ++i) {
-          var node = nodes[i];
-          if (kinds[node[0]]) {
-            for (var slot = 0; slot < kinds[node[0]].arity; ++slot) {
-              if (is_external(links[i+":"+slot])) {
-                cases += "        attach(mem, "+dest_code(i+":"+slot)+");\n";
+              } else {
+                var [j,j_slot] = links[vars[i_slot]].split(":").map(Number);
+                delete links[vars[i_slot]];
+                links[i+":"+i_slot] = j+":"+j_slot;
+                links[j+":"+j_slot] = i+":"+i_slot;
               }
             }
           }
+        } else {
+          links[node[0]] = node[1];
+          links[node[1]] = node[0];
         }
-        cases += "        // checks new nodes for redexes\n";
-        for (var i = 0; i < nodes.length; ++i) {
-          if (kinds[node[0]]) {
-            cases += "        check_redex(mem, n"+i+"_dest);\n";
-          }
-        }
-        cases += "        // checks external ports for redexes\n";
-        for (var slot = 1; slot < a_kind.arity; ++slot) {
-          cases += "        check_redex(mem, get_dest(a_out"+slot+"));\n";
-        }
-        for (var slot = 1; slot < b_kind.arity; ++slot) {
-          cases += "        check_redex(mem, get_dest(b_out"+slot+"));\n";
-        }
-        //for (var slot = 1; slot < a_kind.arity; ++slot) {
-          //if (links["<"+slot] === "<"+slot) {
-            //cases += "        new_ant.push(["+dest_code("<"+slot)+"]);\n";
-          //}
-        //}
-        //for (var slot = 1; slot < b_kind.arity; ++slot) {
-          //if (links[slot+">"] === slot+">") {
-            //cases += "        new_ant.push(["+dest_code(slot+">")+"]);\n";
-          //}
-        //}
-        cases += "        free(mem, a_dest, "+(a_kind.arity+1)+");\n";
-        cases += "        free(mem, b_dest, "+(b_kind.arity+1)+");\n";
-        cases += "        return true;\n";
       }
+
+      // Links unused ports to themselves, triggering erasure
+      for (var i = 1; i < a_kind.arity; ++i) {
+        if (!links["<"+i]) links["<"+i] = "<"+i;
+      }
+      for (var i = 1; i < b_kind.arity; ++i) {
+        if (!links[">"+i]) links[">"+i] = ">"+i;
+      }
+
+      //console.log("LINKS", links);
+      //process.exit();
+      //console.log(kinds);
+
+      // Builds the case code
+      //console.log(a_kind, b_kind);
+      if (a_kind.kind !== b_kind.kind) {
+        cases += "      case "+(a_kind.kind * total_kinds + b_kind.kind)+": // " + b_kind.name+"-"+a_kind.name+";\n";
+        cases += "        return rewrite(mem, b_dest, a_dest);\n";
+      }
+      cases += "      case "+(b_kind.kind * total_kinds + a_kind.kind)+": // " + a_kind.name+"-"+b_kind.name+";\n";
+      //cases += "        console.log('"+a_kind.name+"-"+b_kind.name+"');\n";
+      cases += "        // gets neighbors\n";
+      for (var i = 1; i < a_kind.arity; ++i) {
+        cases += "        a_out"+i+" = mem.val[a_dest+1+"+i+"];\n"
+      }
+      for (var i = 1; i < b_kind.arity; ++i) {
+        cases += "        b_out"+i+" = mem.val[b_dest+1+"+i+"];\n"
+      }
+      cases += "        // allocs new nodes\n";
+      for (var i = 0; i < nodes.length; ++i) {
+        var node = nodes[i];
+        if (kinds[node[0]]) {
+          cases += "        n"+i+"_dest = alloc(mem,"+(kinds[node[0]].arity+1)+");\n";
+        }
+      }
+      cases += "        // fills new nodes\n";
+      for (var i = 0; i < nodes.length; ++i) {
+        var new_node = nodes[i];
+        var new_kind = kinds[new_node[0]];
+        if (new_kind) {
+          cases += "        mem.val[n"+i+"_dest] = "+info_code(new_kind.kind)+";\n";
+          for (var slot = 0; slot < new_kind.arity; ++slot) {
+            var var_name = new_node[slot];
+            //console.log(a_kind.name, b_kind.name, i+":"+slot, links[i+":"+slot])
+            cases += "        mem.val[n"+i+"_dest+1+"+slot+"] = "+dest_code(links[i+":"+slot])+";\n";
+          }
+        }
+      }
+      cases += "        // turns old nodes into air\n";
+      cases += "        mem.val[a_dest] = "+info_code(a_kind.arity)+";\n";
+      cases += "        mem.val[b_dest] = "+info_code(b_kind.arity)+";\n";
+      cases += "        // points air ports to new destinations\n";
+      for (var slot = 1; slot < a_kind.arity; ++slot) {
+        cases += "        mem.val[a_dest+1+"+slot+"] = "+dest_code(links["<"+slot])+";\n";
+      }
+      for (var slot = 1; slot < b_kind.arity; ++slot) {
+        cases += "        mem.val[b_dest+1+"+slot+"] = "+dest_code(links[">"+slot])+";\n";
+      }
+      cases += "        // attaches external ports\n";
+      for (var slot = 1; slot < a_kind.arity; ++slot) {
+        cases += "        attach(mem, a_out"+slot+");\n";
+      }
+      for (var slot = 1; slot < b_kind.arity; ++slot) {
+        cases += "        attach(mem, b_out"+slot+");\n";
+      }
+      cases += "        // attaches internal ports that must point to external ports\n";
+      for (var i = 0; i < nodes.length; ++i) {
+        var node = nodes[i];
+        if (kinds[node[0]]) {
+          for (var slot = 0; slot < kinds[node[0]].arity; ++slot) {
+            if (is_external(links[i+":"+slot])) {
+              cases += "        attach(mem, "+dest_code(i+":"+slot)+");\n";
+            }
+          }
+        }
+      }
+      cases += "        // checks new nodes for redexes\n";
+      for (var i = 0; i < nodes.length; ++i) {
+        if (kinds[node[0]]) {
+          cases += "        check_redex(mem, n"+i+"_dest);\n";
+        }
+      }
+      cases += "        // checks external ports for redexes\n";
+      for (var slot = 1; slot < a_kind.arity; ++slot) {
+        cases += "        check_redex(mem, get_dest(a_out"+slot+"));\n";
+      }
+      for (var slot = 1; slot < b_kind.arity; ++slot) {
+        cases += "        check_redex(mem, get_dest(b_out"+slot+"));\n";
+      }
+      cases += "        free(mem, a_dest, "+(a_kind.arity+1)+");\n";
+      cases += "        free(mem, b_dest, "+(b_kind.arity+1)+");\n";
+      cases += "        return true;\n";
     }
 
     // Completes the kinds object
@@ -784,7 +744,8 @@ module.exports = function INet(rules) {
     ].join("\n");
 
     
-    //console.log(rewrite_source);
+    console.log(rewrite_source);
+    console.log(kinds);
     var rewrite = eval(rewrite_source);
     //console.log(rewrite);
     //process.exit();
@@ -792,7 +753,829 @@ module.exports = function INet(rules) {
     return {cases, kinds, rewrite_source, rewrite};
   };
 
-  var {kinds, rewrite} = build_rules(rules);
+  //var {kinds, rewrite} = build_rules(rules);
+
+  global.stats = {};
+  function register(str) {
+    if (!global.stats[str]) {
+      global.stats[str] = 0;
+    }
+    global.stats[str]++;
+  }
+  function rewrite(mem, a_dest, b_dest) {
+    var a_info, b_info, a_kind, b_kind;
+    var a_out1, a_out2, a_out3, a_out4, a_out5, a_out6, a_out7, a_out8;
+    var a_out1, b_out2, b_out3, b_out4, b_out5, b_out6, b_out7, b_out8;
+    var n0_dest, n1_dest, n2_dest, n3_dest, n4_dest, n5_dest, n6_dest, n7_dest;
+    a_info = mem.val[a_dest];
+    b_info = mem.val[b_dest];
+    a_kind = a_info & 0x7FFF;
+    b_kind = b_info & 0x7FFF;
+    // Performs erasure
+    if (a_dest === b_dest) {
+      switch (a_kind) {
+        case 18: // --O;
+          //register("--O");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          // turns old node into air
+          mem.val[a_dest] = 2;
+          // attaches eraser to neighbor ports
+          mem.val[(a_out1>>>4)+1+(a_out1&0xF)] = a_out1;
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          // frees memory used by node
+          free(mem, a_dest, 3);
+          return true;
+        case 19: // --I;
+          //register("--I");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          // turns old node into air
+          mem.val[a_dest] = 2;
+          // attaches eraser to neighbor ports
+          mem.val[(a_out1>>>4)+1+(a_out1&0xF)] = a_out1;
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          // frees memory used by node
+          free(mem, a_dest, 3);
+          return true;
+        case 20: // --E;
+          //register("--E");
+          // gets neighbors
+          // turns old node into air
+          mem.val[a_dest] = 1;
+          // attaches eraser to neighbor ports
+          // checks external ports for redexes
+          // frees memory used by node
+          free(mem, a_dest, 2);
+          return true;
+        case 21: // --Inc;
+          //register("--I");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          // turns old node into air
+          mem.val[a_dest] = 2;
+          // attaches eraser to neighbor ports
+          mem.val[(a_out1>>>4)+1+(a_out1&0xF)] = a_out1;
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          // frees memory used by node
+          free(mem, a_dest, 3);
+          return true;
+        case 22: // --Rev;
+          //register("--R");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          // turns old node into air
+          mem.val[a_dest] = 3;
+          // attaches eraser to neighbor ports
+          mem.val[(a_out1>>>4)+1+(a_out1&0xF)] = a_out1;
+          mem.val[(a_out2>>>4)+1+(a_out2&0xF)] = a_out2;
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          // frees memory used by node
+          free(mem, a_dest, 4);
+          return true;
+        case 23: // --Fn0;
+          //register("--F");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          // turns old node into air
+          mem.val[a_dest] = 2;
+          // attaches eraser to neighbor ports
+          mem.val[(a_out1>>>4)+1+(a_out1&0xF)] = a_out1;
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          // frees memory used by node
+          free(mem, a_dest, 3);
+          return true;
+        case 24: // --Fn1;
+          //register("--F");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          a_out3 = mem.val[a_dest+1+3];
+          // turns old node into air
+          mem.val[a_dest] = 4;
+          // attaches eraser to neighbor ports
+          mem.val[(a_out1>>>4)+1+(a_out1&0xF)] = a_out1;
+          mem.val[(a_out2>>>4)+1+(a_out2&0xF)] = a_out2;
+          mem.val[(a_out3>>>4)+1+(a_out3&0xF)] = a_out3;
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (a_out3>>>4));
+          // frees memory used by node
+          free(mem, a_dest, 5);
+          return true;
+        case 25: // --Fn2;
+          //register("--F");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          // turns old node into air
+          mem.val[a_dest] = 3;
+          // attaches eraser to neighbor ports
+          mem.val[(a_out1>>>4)+1+(a_out1&0xF)] = a_out1;
+          mem.val[(a_out2>>>4)+1+(a_out2&0xF)] = a_out2;
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          // frees memory used by node
+          free(mem, a_dest, 4);
+          return true;
+      }
+    } else {
+      // Performs reduction
+      switch (b_kind * 26 + a_kind) {
+        case 566: // E-Inc;
+          return rewrite(mem, b_dest, a_dest);
+        case 541: // Inc-E;
+          //register("Inc-E");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,2);
+          // fills new nodes
+          mem.val[n0_dest] = 20;
+          mem.val[n0_dest+1+0] = a_out1;
+          // turns old nodes into air
+          mem.val[a_dest] = 2;
+          mem.val[b_dest] = 1;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 0) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          free(mem, a_dest, 3);
+          free(mem, b_dest, 2);
+          return true;
+        case 564: // O-Inc;
+          return rewrite(mem, b_dest, a_dest);
+        case 489: // Inc-O;
+          //register("Inc-O");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          // fills new nodes
+          mem.val[n0_dest] = 19;
+          mem.val[n0_dest+1+0] = a_out1;
+          mem.val[n0_dest+1+1] = b_out1;
+          // turns old nodes into air
+          mem.val[a_dest] = 2;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[b_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 0) >>> 0));
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 3);
+          free(mem, b_dest, 3);
+          return true;
+        case 565: // I-Inc;
+          return rewrite(mem, b_dest, a_dest);
+        case 515: // Inc-I;
+          //register("Inc-I");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          n1_dest = alloc(mem,3);
+          // fills new nodes
+          mem.val[n0_dest] = 21;
+          mem.val[n0_dest+1+0] = b_out1;
+          mem.val[n0_dest+1+1] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[n1_dest] = 18;
+          mem.val[n1_dest+1+0] = a_out1;
+          mem.val[n1_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          // turns old nodes into air
+          mem.val[a_dest] = 2;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n1_dest << 4) | 0) >>> 0);
+          mem.val[b_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 0) >>> 0));
+          attach(mem, (((n1_dest << 4) | 0) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 3);
+          free(mem, b_dest, 3);
+          return true;
+        case 592: // E-Rev;
+          return rewrite(mem, b_dest, a_dest);
+        case 542: // Rev-E;
+          //register("Rev-E");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          // allocs new nodes
+          // fills new nodes
+          // turns old nodes into air
+          mem.val[a_dest] = 3;
+          mem.val[b_dest] = 1;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = a_out2;
+          mem.val[a_dest+1+2] = a_out1;
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          // attaches internal ports that must point to external ports
+          // checks new nodes for redexes
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          free(mem, a_dest, 4);
+          free(mem, b_dest, 2);
+          return true;
+        case 590: // O-Rev;
+          return rewrite(mem, b_dest, a_dest);
+        case 490: // Rev-O;
+          //register("Rev-O");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          n1_dest = alloc(mem,4);
+          // fills new nodes
+          mem.val[n0_dest] = 18;
+          mem.val[n0_dest+1+0] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[n0_dest+1+1] = a_out1;
+          mem.val[n1_dest] = 22;
+          mem.val[n1_dest+1+0] = b_out1;
+          mem.val[n1_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n1_dest+1+2] = a_out2;
+          // turns old nodes into air
+          mem.val[a_dest] = 3;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+2] = (((n1_dest << 4) | 2) >>> 0);
+          mem.val[b_dest+1+1] = (((n1_dest << 4) | 0) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n1_dest << 4) | 0) >>> 0));
+          attach(mem, (((n1_dest << 4) | 2) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 4);
+          free(mem, b_dest, 3);
+          return true;
+        case 591: // I-Rev;
+          return rewrite(mem, b_dest, a_dest);
+        case 516: // Rev-I;
+          //register("Rev-I");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          n1_dest = alloc(mem,4);
+          // fills new nodes
+          mem.val[n0_dest] = 19;
+          mem.val[n0_dest+1+0] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[n0_dest+1+1] = a_out1;
+          mem.val[n1_dest] = 22;
+          mem.val[n1_dest+1+0] = b_out1;
+          mem.val[n1_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n1_dest+1+2] = a_out2;
+          // turns old nodes into air
+          mem.val[a_dest] = 3;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+2] = (((n1_dest << 4) | 2) >>> 0);
+          mem.val[b_dest+1+1] = (((n1_dest << 4) | 0) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n1_dest << 4) | 0) >>> 0));
+          attach(mem, (((n1_dest << 4) | 2) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 4);
+          free(mem, b_dest, 3);
+          return true;
+        case 618: // E-Fn0;
+          return rewrite(mem, b_dest, a_dest);
+        case 543: // Fn0-E;
+          //register("Fn0-E");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,2);
+          n1_dest = alloc(mem,3);
+          n2_dest = alloc(mem,2);
+          n3_dest = alloc(mem,2);
+          n4_dest = alloc(mem,5);
+          // fills new nodes
+          mem.val[n0_dest] = 20;
+          mem.val[n0_dest+1+0] = (((n1_dest << 4) | 0) >>> 0);
+          mem.val[n1_dest] = 21;
+          mem.val[n1_dest+1+0] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n1_dest+1+1] = (((n4_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest] = 20;
+          mem.val[n2_dest+1+0] = (((n4_dest << 4) | 1) >>> 0);
+          mem.val[n3_dest] = 20;
+          mem.val[n3_dest+1+0] = (((n4_dest << 4) | 2) >>> 0);
+          mem.val[n4_dest] = 24;
+          mem.val[n4_dest+1+0] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[n4_dest+1+1] = (((n2_dest << 4) | 0) >>> 0);
+          mem.val[n4_dest+1+2] = (((n3_dest << 4) | 0) >>> 0);
+          mem.val[n4_dest+1+3] = a_out1;
+          // turns old nodes into air
+          mem.val[a_dest] = 2;
+          mem.val[b_dest] = 1;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n4_dest << 4) | 3) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n4_dest << 4) | 3) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          check_redex(mem, n2_dest);
+          check_redex(mem, n3_dest);
+          check_redex(mem, n4_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          free(mem, a_dest, 3);
+          free(mem, b_dest, 2);
+          return true;
+        case 616: // O-Fn0;
+          return rewrite(mem, b_dest, a_dest);
+        case 491: // Fn0-O;
+          //register("Fn0-O");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          n1_dest = alloc(mem,3);
+          n2_dest = alloc(mem,2);
+          n3_dest = alloc(mem,2);
+          n4_dest = alloc(mem,5);
+          // fills new nodes
+          mem.val[n0_dest] = 18;
+          mem.val[n0_dest+1+0] = (((n1_dest << 4) | 0) >>> 0);
+          mem.val[n0_dest+1+1] = b_out1;
+          mem.val[n1_dest] = 21;
+          mem.val[n1_dest+1+0] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n1_dest+1+1] = (((n4_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest] = 20;
+          mem.val[n2_dest+1+0] = (((n4_dest << 4) | 1) >>> 0);
+          mem.val[n3_dest] = 20;
+          mem.val[n3_dest+1+0] = (((n4_dest << 4) | 2) >>> 0);
+          mem.val[n4_dest] = 24;
+          mem.val[n4_dest+1+0] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[n4_dest+1+1] = (((n2_dest << 4) | 0) >>> 0);
+          mem.val[n4_dest+1+2] = (((n3_dest << 4) | 0) >>> 0);
+          mem.val[n4_dest+1+3] = a_out1;
+          // turns old nodes into air
+          mem.val[a_dest] = 2;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n4_dest << 4) | 3) >>> 0);
+          mem.val[b_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n4_dest << 4) | 3) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          check_redex(mem, n2_dest);
+          check_redex(mem, n3_dest);
+          check_redex(mem, n4_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 3);
+          free(mem, b_dest, 3);
+          return true;
+        case 617: // I-Fn0;
+          return rewrite(mem, b_dest, a_dest);
+        case 517: // Fn0-I;
+          //register("Fn0-I");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          n1_dest = alloc(mem,3);
+          n2_dest = alloc(mem,2);
+          n3_dest = alloc(mem,2);
+          n4_dest = alloc(mem,5);
+          // fills new nodes
+          mem.val[n0_dest] = 19;
+          mem.val[n0_dest+1+0] = (((n1_dest << 4) | 0) >>> 0);
+          mem.val[n0_dest+1+1] = b_out1;
+          mem.val[n1_dest] = 21;
+          mem.val[n1_dest+1+0] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n1_dest+1+1] = (((n4_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest] = 20;
+          mem.val[n2_dest+1+0] = (((n4_dest << 4) | 1) >>> 0);
+          mem.val[n3_dest] = 20;
+          mem.val[n3_dest+1+0] = (((n4_dest << 4) | 2) >>> 0);
+          mem.val[n4_dest] = 24;
+          mem.val[n4_dest+1+0] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[n4_dest+1+1] = (((n2_dest << 4) | 0) >>> 0);
+          mem.val[n4_dest+1+2] = (((n3_dest << 4) | 0) >>> 0);
+          mem.val[n4_dest+1+3] = a_out1;
+          // turns old nodes into air
+          mem.val[a_dest] = 2;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n4_dest << 4) | 3) >>> 0);
+          mem.val[b_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n4_dest << 4) | 3) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          check_redex(mem, n2_dest);
+          check_redex(mem, n3_dest);
+          check_redex(mem, n4_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 3);
+          free(mem, b_dest, 3);
+          return true;
+        case 644: // E-Fn1;
+          return rewrite(mem, b_dest, a_dest);
+        case 544: // Fn1-E;
+          //register("Fn1-E");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          a_out3 = mem.val[a_dest+1+3];
+          // allocs new nodes
+          n0_dest = alloc(mem,4);
+          // fills new nodes
+          mem.val[n0_dest] = 25;
+          mem.val[n0_dest+1+0] = a_out1;
+          mem.val[n0_dest+1+1] = a_out2;
+          mem.val[n0_dest+1+2] = a_out3;
+          // turns old nodes into air
+          mem.val[a_dest] = 4;
+          mem.val[b_dest] = 1;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[a_dest+1+2] = (((n0_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+3] = (((n0_dest << 4) | 2) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          attach(mem, a_out3);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 0) >>> 0));
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n0_dest << 4) | 2) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (a_out3>>>4));
+          free(mem, a_dest, 5);
+          free(mem, b_dest, 2);
+          return true;
+        case 642: // O-Fn1;
+          return rewrite(mem, b_dest, a_dest);
+        case 492: // Fn1-O;
+          //register("Fn1-O");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          a_out3 = mem.val[a_dest+1+3];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          n1_dest = alloc(mem,3);
+          n2_dest = alloc(mem,5);
+          // fills new nodes
+          mem.val[n0_dest] = 18;
+          mem.val[n0_dest+1+0] = (((n2_dest << 4) | 1) >>> 0);
+          mem.val[n0_dest+1+1] = a_out1;
+          mem.val[n1_dest] = 18;
+          mem.val[n1_dest+1+0] = (((n2_dest << 4) | 2) >>> 0);
+          mem.val[n1_dest+1+1] = a_out2;
+          mem.val[n2_dest] = 24;
+          mem.val[n2_dest+1+0] = b_out1;
+          mem.val[n2_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest+1+2] = (((n1_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest+1+3] = a_out3;
+          // turns old nodes into air
+          mem.val[a_dest] = 4;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+2] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+3] = (((n2_dest << 4) | 3) >>> 0);
+          mem.val[b_dest+1+1] = (((n2_dest << 4) | 0) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          attach(mem, a_out3);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n1_dest << 4) | 1) >>> 0));
+          attach(mem, (((n2_dest << 4) | 0) >>> 0));
+          attach(mem, (((n2_dest << 4) | 3) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          check_redex(mem, n2_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (a_out3>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 5);
+          free(mem, b_dest, 3);
+          return true;
+        case 643: // I-Fn1;
+          return rewrite(mem, b_dest, a_dest);
+        case 518: // Fn1-I;
+          //register("Fn1-I");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          a_out3 = mem.val[a_dest+1+3];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,3);
+          n1_dest = alloc(mem,3);
+          n2_dest = alloc(mem,5);
+          // fills new nodes
+          mem.val[n0_dest] = 19;
+          mem.val[n0_dest+1+0] = (((n2_dest << 4) | 1) >>> 0);
+          mem.val[n0_dest+1+1] = a_out1;
+          mem.val[n1_dest] = 19;
+          mem.val[n1_dest+1+0] = (((n2_dest << 4) | 2) >>> 0);
+          mem.val[n1_dest+1+1] = a_out2;
+          mem.val[n2_dest] = 24;
+          mem.val[n2_dest+1+0] = b_out1;
+          mem.val[n2_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest+1+2] = (((n1_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest+1+3] = a_out3;
+          // turns old nodes into air
+          mem.val[a_dest] = 4;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+2] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+3] = (((n2_dest << 4) | 3) >>> 0);
+          mem.val[b_dest+1+1] = (((n2_dest << 4) | 0) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          attach(mem, a_out3);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n1_dest << 4) | 1) >>> 0));
+          attach(mem, (((n2_dest << 4) | 0) >>> 0));
+          attach(mem, (((n2_dest << 4) | 3) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          check_redex(mem, n2_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (a_out3>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 5);
+          free(mem, b_dest, 3);
+          return true;
+        case 670: // E-Fn2;
+          return rewrite(mem, b_dest, a_dest);
+        case 545: // Fn2-E;
+          //register("Fn2-E");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          // allocs new nodes
+          // fills new nodes
+          // turns old nodes into air
+          mem.val[a_dest] = 3;
+          mem.val[b_dest] = 1;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = a_out2;
+          mem.val[a_dest+1+2] = a_out1;
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          // attaches internal ports that must point to external ports
+          // checks new nodes for redexes
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          free(mem, a_dest, 4);
+          free(mem, b_dest, 2);
+          return true;
+        case 668: // O-Fn2;
+          return rewrite(mem, b_dest, a_dest);
+        case 493: // Fn2-O;
+          //register("Fn2-O");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,2);
+          n1_dest = alloc(mem,4);
+          n2_dest = alloc(mem,3);
+          // fills new nodes
+          mem.val[n0_dest] = 20;
+          mem.val[n0_dest+1+0] = (((n1_dest << 4) | 1) >>> 0);
+          mem.val[n1_dest] = 22;
+          mem.val[n1_dest+1+0] = a_out1;
+          mem.val[n1_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          mem.val[n1_dest+1+2] = (((n2_dest << 4) | 0) >>> 0);
+          mem.val[n2_dest] = 23;
+          mem.val[n2_dest+1+0] = (((n1_dest << 4) | 2) >>> 0);
+          mem.val[n2_dest+1+1] = a_out2;
+          // turns old nodes into air
+          mem.val[a_dest] = 3;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n1_dest << 4) | 0) >>> 0);
+          mem.val[a_dest+1+2] = (((n2_dest << 4) | 1) >>> 0);
+          mem.val[b_dest+1+1] = b_out1;
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n1_dest << 4) | 0) >>> 0));
+          attach(mem, (((n2_dest << 4) | 1) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          check_redex(mem, n1_dest);
+          check_redex(mem, n2_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 4);
+          free(mem, b_dest, 3);
+          return true;
+        case 669: // I-Fn2;
+          return rewrite(mem, b_dest, a_dest);
+        case 519: // Fn2-I;
+          //register("Fn2-I");
+          // gets neighbors
+          a_out1 = mem.val[a_dest+1+1];
+          a_out2 = mem.val[a_dest+1+2];
+          b_out1 = mem.val[b_dest+1+1];
+          // allocs new nodes
+          n0_dest = alloc(mem,4);
+          // fills new nodes
+          mem.val[n0_dest] = 25;
+          mem.val[n0_dest+1+0] = b_out1;
+          mem.val[n0_dest+1+1] = a_out1;
+          mem.val[n0_dest+1+2] = a_out2;
+          // turns old nodes into air
+          mem.val[a_dest] = 3;
+          mem.val[b_dest] = 2;
+          // points air ports to new destinations
+          mem.val[a_dest+1+1] = (((n0_dest << 4) | 1) >>> 0);
+          mem.val[a_dest+1+2] = (((n0_dest << 4) | 2) >>> 0);
+          mem.val[b_dest+1+1] = (((n0_dest << 4) | 0) >>> 0);
+          // attaches external ports
+          attach(mem, a_out1);
+          attach(mem, a_out2);
+          attach(mem, b_out1);
+          // attaches internal ports that must point to external ports
+          attach(mem, (((n0_dest << 4) | 0) >>> 0));
+          attach(mem, (((n0_dest << 4) | 1) >>> 0));
+          attach(mem, (((n0_dest << 4) | 2) >>> 0));
+          // checks new nodes for redexes
+          check_redex(mem, n0_dest);
+          // checks external ports for redexes
+          check_redex(mem, (a_out1>>>4));
+          check_redex(mem, (a_out2>>>4));
+          check_redex(mem, (b_out1>>>4));
+          free(mem, a_dest, 4);
+          free(mem, b_dest, 3);
+          return true;
+      }
+    }
+    return false;
+  }
+
+  var kinds = {
+    '0': { name: 'Air0', arity: 0, kind: 0, is_ctor: false },
+    '1': { name: 'Air1', arity: 1, kind: 1, is_ctor: false },
+    '2': { name: 'Air2', arity: 2, kind: 2, is_ctor: false },
+    '3': { name: 'Air3', arity: 3, kind: 3, is_ctor: false },
+    '4': { name: 'Air4', arity: 4, kind: 4, is_ctor: false },
+    '5': { name: 'Air5', arity: 5, kind: 5, is_ctor: false },
+    '6': { name: 'Air6', arity: 6, kind: 6, is_ctor: false },
+    '7': { name: 'Air7', arity: 7, kind: 7, is_ctor: false },
+    '8': { name: 'Air8', arity: 8, kind: 8, is_ctor: false },
+    '9': { name: 'Air9', arity: 9, kind: 9, is_ctor: false },
+    '10': { name: 'Air10', arity: 10, kind: 10, is_ctor: false },
+    '11': { name: 'Air11', arity: 11, kind: 11, is_ctor: false },
+    '12': { name: 'Air12', arity: 12, kind: 12, is_ctor: false },
+    '13': { name: 'Air13', arity: 13, kind: 13, is_ctor: false },
+    '14': { name: 'Air14', arity: 14, kind: 14, is_ctor: false },
+    '15': { name: 'Air15', arity: 15, kind: 15, is_ctor: false },
+    '16': { name: 'Rot', arity: 1, kind: 16, is_ctor: false },
+    '17': { name: 'Era', arity: 1, kind: 17, is_ctor: false },
+    '18': { name: 'O', arity: 2, is_ctor: true, kind: 18 },
+    '19': { name: 'I', arity: 2, is_ctor: true, kind: 19 },
+    '20': { name: 'E', arity: 1, is_ctor: true, kind: 20 },
+    '21': { name: 'Inc', arity: 2, is_ctor: false, kind: 21 },
+    '22': { name: 'Rev', arity: 3, is_ctor: false, kind: 22 },
+    '23': { name: 'Fn0', arity: 2, is_ctor: false, kind: 23 },
+    '24': { name: 'Fn1', arity: 4, is_ctor: false, kind: 24 },
+    '25': { name: 'Fn2', arity: 3, is_ctor: false, kind: 25 },
+    Air0: { name: 'Air0', arity: 0, kind: 0, is_ctor: false },
+    Air1: { name: 'Air1', arity: 1, kind: 1, is_ctor: false },
+    Air2: { name: 'Air2', arity: 2, kind: 2, is_ctor: false },
+    Air3: { name: 'Air3', arity: 3, kind: 3, is_ctor: false },
+    Air4: { name: 'Air4', arity: 4, kind: 4, is_ctor: false },
+    Air5: { name: 'Air5', arity: 5, kind: 5, is_ctor: false },
+    Air6: { name: 'Air6', arity: 6, kind: 6, is_ctor: false },
+    Air7: { name: 'Air7', arity: 7, kind: 7, is_ctor: false },
+    Air8: { name: 'Air8', arity: 8, kind: 8, is_ctor: false },
+    Air9: { name: 'Air9', arity: 9, kind: 9, is_ctor: false },
+    Air10: { name: 'Air10', arity: 10, kind: 10, is_ctor: false },
+    Air11: { name: 'Air11', arity: 11, kind: 11, is_ctor: false },
+    Air12: { name: 'Air12', arity: 12, kind: 12, is_ctor: false },
+    Air13: { name: 'Air13', arity: 13, kind: 13, is_ctor: false },
+    Air14: { name: 'Air14', arity: 14, kind: 14, is_ctor: false },
+    Air15: { name: 'Air15', arity: 15, kind: 15, is_ctor: false },
+    Rot: { name: 'Rot', arity: 1, kind: 16, is_ctor: false },
+    Era: { name: 'Era', arity: 1, kind: 17, is_ctor: false },
+    O: { name: 'O', arity: 2, is_ctor: true, kind: 18 },
+    I: { name: 'I', arity: 2, is_ctor: true, kind: 19 },
+    E: { name: 'E', arity: 1, is_ctor: true, kind: 20 },
+    Inc: { name: 'Inc', arity: 2, is_ctor: false, kind: 21 },
+    Rev: { name: 'Rev', arity: 3, is_ctor: false, kind: 22 },
+    Fn0: { name: 'Fn0', arity: 2, is_ctor: false, kind: 23 },
+    Fn1: { name: 'Fn1', arity: 4, is_ctor: false, kind: 24 },
+    Fn2: { name: 'Fn2', arity: 3, is_ctor: false, kind: 25 }
+  }
 
   return {
     build_rules,
